@@ -1,0 +1,29 @@
+---
+# Initialize the swarm on the manager, then join the workers.
+# This role is applied to the managers group first, then the workers group
+# (see site.yml), so the worker join token is available via hostvars.
+
+# ---- Manager -------------------------------------------------------------
+- name: Initialize Docker Swarm on the manager
+  community.docker.docker_swarm:
+    state: present
+    advertise_addr: "{{ swarm_advertise_addr }}"
+  register: swarm_init
+  when: inventory_hostname in groups['managers']
+
+- name: Capture the worker join token as a fact on the manager
+  ansible.builtin.set_fact:
+    swarm_worker_join_token: "{{ swarm_init.swarm_facts.JoinTokens.Worker }}"
+  when:
+    - inventory_hostname in groups['managers']
+    - swarm_init.swarm_facts is defined
+
+# ---- Workers -------------------------------------------------------------
+- name: Join workers to the swarm
+  community.docker.docker_swarm:
+    state: join
+    advertise_addr: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+    join_token: "{{ hostvars[swarm_manager_host]['swarm_worker_join_token'] }}"
+    remote_addrs:
+      - "{{ swarm_advertise_addr }}:{{ swarm_manager_port }}"
+  when: inventory_hostname in groups['workers']

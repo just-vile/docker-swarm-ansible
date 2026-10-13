@@ -1,0 +1,46 @@
+---
+# ===========================================================================
+# Docker Swarm cluster provisioning
+#   Play 1: install Docker on every node
+#   Play 2: initialize the swarm on the manager
+#   Play 3: join the workers using the manager's token
+# Run with: ansible-playbook site.yml
+# ===========================================================================
+
+- name: Prepare all nodes and install Docker
+  hosts: swarm
+  become: true
+  roles:
+    - common
+    - docker
+
+- name: Initialize swarm on the manager
+  hosts: managers
+  become: true
+  roles:
+    - swarm
+
+- name: Join workers to the swarm
+  hosts: workers
+  become: true
+  roles:
+    - swarm
+
+- name: Deploy the monitoring stack on the manager
+  hosts: managers
+  become: true
+  roles:
+    - role: monitoring
+      when: monitoring_enabled | bool
+
+- name: Show cluster status
+  hosts: managers
+  become: true
+  tasks:
+    - name: List swarm nodes
+      community.docker.docker_node_info:
+      register: node_info
+
+    - name: Display node summary
+      ansible.builtin.debug:
+        msg: "{{ node_info.nodes | map(attribute='Description.Hostname') | list }}"

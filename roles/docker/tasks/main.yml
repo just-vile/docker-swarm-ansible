@@ -1,0 +1,60 @@
+---
+# Install Docker CE from the official Docker APT repository.
+
+- name: Create keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Add Docker's official GPG key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Add Docker APT repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else ansible_architecture }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu
+      {{ ansible_distribution_release }} {{ docker_apt_channel }}
+    filename: docker
+    state: present
+
+- name: Install Docker Engine and plugins
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+    update_cache: true
+  notify: Restart docker
+
+# Revert to the classic overlay2 image store. Docker 28+ defaults to the
+# containerd snapshotter, whose layer layout cAdvisor can't read, so container
+# metrics show up empty. This writes /etc/docker/daemon.json and restarts
+# Docker, which re-pulls service images into the overlay2 store.
+- name: Disable the containerd image store (use overlay2 for cAdvisor)
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "features": {
+          "containerd-snapshotter": false
+        }
+      }
+    mode: "0644"
+  notify: Restart docker
+  when: docker_disable_containerd_snapshotter | bool
+
+- name: Ensure Docker service is enabled and running
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Add user to the docker group
+  ansible.builtin.user:
+    name: "{{ docker_user }}"
+    groups: docker
+    append: true

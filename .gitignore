@@ -1,0 +1,31 @@
+# Ansible
+*.retry
+*.log
+
+# Vault / secrets (if you add them later)
+vault_pass.txt
+*.vault
+
+# SSH keys — never commit private keys
+id_ed25519
+id_rsa
+id_ecdsa
+id_dsa
+*.pem
+*.key
+*_rsa
+*_ed25519
+# (public keys are safe to share; un-ignore them explicitly if you want to track one)
+!*.pub
+
+# Downloaded collections
+collections/
+
+# Local Ansible / editor artifacts
+*.swp
+.vault_pass
+hosts.local.ini
+inventory/*.local.ini
+
+.claude/
+id_ed25519.pub

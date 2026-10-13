@@ -1,0 +1,15 @@
+# Managed by Ansible (roles/monitoring). Loads every dashboard JSON found in
+# /var/lib/grafana/dashboards (bind-mounted from the manager).
+apiVersion: 1
+
+providers:
+  - name: swarm
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

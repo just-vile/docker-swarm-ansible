@@ -1,0 +1,13 @@
+# Managed by Ansible (roles/monitoring). Auto-wires the Prometheus datasource
+# so Grafana needs no manual setup on first start. 'prometheus' resolves on the
+# 'monitoring' overlay network to the Prometheus service.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

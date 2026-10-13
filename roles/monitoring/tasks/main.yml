@@ -1,0 +1,78 @@
+---
+# Deploy the Prometheus + Grafana + Portainer monitoring stack.
+#
+# This role runs on the manager only (see site.yml). Config files are
+# templated into {{ monitoring_dir }} on the manager and bind-mounted by the
+# manager-pinned services (prometheus, grafana, portainer). The global
+# services (node-exporter, cadvisor, portainer agent) run one task per node.
+
+- name: Ensure monitoring config directories exist on the manager
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ monitoring_dir }}"
+    - "{{ monitoring_dir }}/prometheus"
+    - "{{ monitoring_dir }}/grafana/provisioning/datasources"
+    - "{{ monitoring_dir }}/grafana/provisioning/dashboards"
+    - "{{ monitoring_dir }}/grafana/dashboards"
+
+- name: Template the Prometheus scrape config
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: "{{ monitoring_dir }}/prometheus/prometheus.yml"
+    mode: "0644"
+
+- name: Install the Grafana Prometheus datasource
+  ansible.builtin.copy:
+    src: grafana/provisioning/datasources/prometheus.yml
+    dest: "{{ monitoring_dir }}/grafana/provisioning/datasources/prometheus.yml"
+    mode: "0644"
+
+- name: Install the Grafana dashboard provider
+  ansible.builtin.copy:
+    src: grafana/provisioning/dashboards/dashboards.yml
+    dest: "{{ monitoring_dir }}/grafana/provisioning/dashboards/dashboards.yml"
+    mode: "0644"
+
+- name: Install the bundled Grafana dashboards
+  ansible.builtin.copy:
+    src: grafana/dashboards/
+    dest: "{{ monitoring_dir }}/grafana/dashboards/"
+    mode: "0644"
+
+- name: Template the monitoring stack compose file
+  ansible.builtin.template:
+    src: monitoring-stack.yml.j2
+    dest: "{{ monitoring_dir }}/monitoring-stack.yml"
+    mode: "0644"
+
+# Optionally open the UI ports when ufw is managed. Exporter and agent
+# ports stay internal to the 'monitoring' overlay network.
+- name: Open monitoring UI ports (ufw)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop:
+    - "{{ grafana_port }}"
+    - "{{ prometheus_port }}"
+    - "{{ portainer_port }}"
+  when: configure_ufw | bool
+
+# The docker_stack module diffs the deployed stack and needs jsondiff
+# (and PyYAML) on the manager to do so.
+- name: Install Python deps for the docker_stack module
+  ansible.builtin.pip:
+    name:
+      - jsondiff
+      - pyyaml
+    state: present
+
+- name: Deploy the monitoring stack
+  community.docker.docker_stack:
+    name: monitoring
+    compose:
+      - "{{ monitoring_dir }}/monitoring-stack.yml"
+    state: present

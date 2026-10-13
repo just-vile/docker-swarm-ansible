@@ -1,0 +1,80 @@
+---
+# ---------------------------------------------------------------------------
+# Global variables for the Docker Swarm cluster
+# ---------------------------------------------------------------------------
+
+# Docker APT repo channel: "stable" (recommended), "test", or "nightly".
+docker_apt_channel: stable
+
+# Packages installed from the official Docker repository.
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# The user that should be added to the 'docker' group (so it can run docker
+# without sudo). Defaults to the SSH user set in the inventory.
+docker_user: "{{ ansible_user }}"
+
+# Docker 28+ defaults to the containerd image store (the "overlayfs"
+# snapshotter), whose layer layout cAdvisor cannot read — per-container
+# metrics come up empty. Disabling it reverts to the classic overlay2 store
+# that cAdvisor understands. Leave true unless you have a reason not to.
+docker_disable_containerd_snapshotter: true
+
+# ---------------------------------------------------------------------------
+# Swarm settings
+# ---------------------------------------------------------------------------
+
+# Inventory hostname of the node that initializes the swarm (the manager).
+swarm_manager_host: swarm-mgr-1
+
+# Address the manager advertises to the rest of the cluster.
+# Uses the manager's inventory ansible_host so there is a single source of truth.
+swarm_advertise_addr: "{{ hostvars[swarm_manager_host]['ansible_host'] }}"
+
+# Port the manager listens on for cluster management (join address).
+swarm_manager_port: 2377
+
+# Open the required swarm ports with ufw. Set to false on a flat lab LAN
+# where ufw is disabled (the default for a fresh Ubuntu Server install).
+configure_ufw: false
+
+# ---------------------------------------------------------------------------
+# Monitoring stack (Prometheus + Grafana + Portainer)
+# Deployed as a single Docker stack onto the swarm by the 'monitoring' role.
+# ---------------------------------------------------------------------------
+
+# Master switch for the whole monitoring play.
+monitoring_enabled: true
+
+# Directory on the manager where configs live and are bind-mounted from.
+monitoring_dir: /opt/monitoring
+
+# Published UI ports (reachable on the manager's IP).
+grafana_port: 3000
+prometheus_port: 9090        # Prometheus UI/Targets page exposed
+portainer_port: 9443         # Portainer HTTPS UI
+
+# Grafana admin login. Plaintext for this lab setup — change from the
+# default and keep this file out of any public push.
+grafana_admin_password: admin
+
+# Prometheus on-disk retention.
+prometheus_retention: 15d
+
+# Alertmanager is intentionally left off for now; flip to add it later.
+alertmanager_enabled: false
+
+# Portainer (cluster/stack management UI + per-node agent).
+portainer_enabled: true
+
+# Pinned image tags for reproducible deploys.
+prometheus_image: prom/prometheus:v2.54.1
+grafana_image: grafana/grafana:11.2.0
+node_exporter_image: prom/node-exporter:v1.8.2
+cadvisor_image: gcr.io/cadvisor/cadvisor:v0.49.1
+portainer_image: portainer/portainer-ce:2.21.4
+portainer_agent_image: portainer/agent:2.21.4
