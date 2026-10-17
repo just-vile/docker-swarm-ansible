@@ -1,0 +1,58 @@
+---
+# Deploy the metric-driven autoscaler.
+#
+# Runs on the manager only (see site.yml). The autoscaler image is built
+# locally here (Swarm never builds, and the service is manager-pinned so the
+# image only needs to exist on the manager). The image is tagged with a hash
+# of the script, so a changed script yields a new tag and Swarm rolls the
+# service; an unchanged script rebuilds nothing and redeploys cleanly.
+
+- name: Ensure the autoscaler directory exists on the manager
+  ansible.builtin.file:
+    path: "{{ autoscaler_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy the autoscaler script
+  ansible.builtin.copy:
+    src: autoscaler.py
+    dest: "{{ autoscaler_dir }}/autoscaler.py"
+    mode: "0644"
+  register: autoscaler_script
+
+- name: Copy the autoscaler Dockerfile
+  ansible.builtin.copy:
+    src: Dockerfile
+    dest: "{{ autoscaler_dir }}/Dockerfile"
+    mode: "0644"
+
+- name: Derive the image tag from the script checksum
+  ansible.builtin.set_fact:
+    autoscaler_image: "{{ autoscaler_image_repo }}:{{ autoscaler_script.checksum[:12] }}"
+
+- name: Build the autoscaler image on the manager
+  community.docker.docker_image:
+    name: "{{ autoscaler_image }}"
+    build:
+      path: "{{ autoscaler_dir }}"
+    source: build
+    state: present
+
+- name: Template the scaling rules
+  ansible.builtin.template:
+    src: rules.yml.j2
+    dest: "{{ autoscaler_dir }}/rules.yml"
+    mode: "0644"
+
+- name: Template the autoscaler stack compose file
+  ansible.builtin.template:
+    src: autoscaler-stack.yml.j2
+    dest: "{{ autoscaler_dir }}/autoscaler-stack.yml"
+    mode: "0644"
+
+- name: Deploy the autoscaler stack
+  community.docker.docker_stack:
+    name: autoscaler
+    compose:
+      - "{{ autoscaler_dir }}/autoscaler-stack.yml"
+    state: present

@@ -33,6 +33,13 @@
     - role: monitoring
       when: monitoring_enabled | bool
 
+- name: Deploy the autoscaler on the manager
+  hosts: managers
+  become: true
+  roles:
+    - role: autoscaler
+      when: autoscaler_enabled | bool
+
 - name: Show cluster status
   hosts: managers
   become: true

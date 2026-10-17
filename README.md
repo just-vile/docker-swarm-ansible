@@ -135,6 +135,52 @@ Open in a browser (manager IP):
 To deploy the cluster without monitoring, set `monitoring_enabled: false`.
 Drop Portainer with `portainer_enabled: false`.
 
+## 6. Autoscaler
+
+The last play deploys a **metric-driven autoscaler** (role `autoscaler`, stack
+`autoscaler`) onto the manager. It polls the monitoring stack's Prometheus for
+each target service's CPU and memory and changes replica counts via the Docker
+API — no extra metrics infrastructure, it reuses Prometheus + cAdvisor.
+
+| Setting                   | Where            | Meaning                                  |
+|---------------------------|------------------|------------------------------------------|
+| `autoscaler_enabled`      | `group_vars`     | master switch for the play               |
+| `autoscaler_poll_interval`| `group_vars`     | seconds between evaluations (default 30) |
+| `autoscale_services`      | `group_vars`     | per-service thresholds / bounds / steps  |
+
+Decision policy per service, each cycle: scale **up** if `CPU% ≥ cpu_high`
+**or** `MEM% ≥ mem_high`; scale **down** only if `CPU% ≤ cpu_low` **and**
+`MEM% ≤ mem_low`; the target is clamped to `[min, max]`, up-steps are larger
+than down-steps, and a per-service `cooldown` prevents oscillation. Both CPU
+and memory are measured as a **percentage of the service's own limit**, so the
+thresholds are limit-relative (e.g. `cpu_high: 80` = 80% of `limits.cpus`).
+
+The autoscaler builds its own small Python image **locally on the manager**
+(Swarm doesn't build; the service is manager-pinned so the image only needs to
+exist there) and joins the existing `monitoring_monitoring` overlay network to
+reach Prometheus. It scales the **todo** app's `todo_frontend` only;
+`todo_backend` and `todo_db` (single-replica MongoDB, stateful) are left out.
+
+**Prerequisites on the target services** (already applied in the todo
+`docker-stack.yml`): each scalable service must declare
+`deploy.resources.limits.memory` so memory can be read as a percentage of its
+limit, and its compose `replicas` should equal the autoscaler's `min`.
+
+> Caveat: re-running `docker stack deploy -c docker-stack.yml todo` resets
+> replicas to the compose value, overriding the autoscaler until the next
+> cycle. Keeping compose `replicas` == `min` makes that reset harmless.
+
+Watch it work:
+
+```bash
+ssh root@192.168.71.100 'docker service logs -f autoscaler_autoscaler'
+# in another shell, drive load at the todo frontend:
+hey -z 120s -c 100 http://192.168.71.100:8080/
+ssh root@192.168.71.100 'docker service ls'   # todo_frontend climbs, then falls after load stops
+```
+
+To deploy the cluster without the autoscaler, set `autoscaler_enabled: false`.
+
 ## Notes
 
 - **Swarm ports**: 2377/tcp (management), 7946/tcp+udp (discovery), 4789/udp (overlay).

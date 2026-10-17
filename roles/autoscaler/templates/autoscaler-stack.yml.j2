@@ -1,0 +1,36 @@
+# Managed by Ansible (roles/autoscaler). Deployed with:
+#   docker stack deploy -c autoscaler-stack.yml autoscaler
+#
+# A single manager-pinned service that polls Prometheus and rescales the
+# services listed in rules.yml. It joins the existing monitoring overlay
+# network (created by the 'monitoring' stack) to reach Prometheus by name,
+# and mounts the Docker socket to change replica counts via the manager API.
+version: "3.8"
+
+networks:
+  monitoring:
+    external: true
+    name: monitoring_monitoring
+
+services:
+  autoscaler:
+    image: {{ autoscaler_image }}
+    environment:
+      PROMETHEUS_URL: "{{ prometheus_query_url }}"
+      POLL_INTERVAL: "{{ autoscaler_poll_interval }}"
+      RULES_FILE: "/config/rules.yml"
+    volumes:
+      # Read-write: scaling a service is a write against the manager API.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - {{ autoscaler_dir }}/rules.yml:/config/rules.yml:ro
+    networks:
+      - monitoring
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          # Replica changes require the Swarm manager API.
+          - node.role == manager
+      restart_policy:
+        condition: on-failure

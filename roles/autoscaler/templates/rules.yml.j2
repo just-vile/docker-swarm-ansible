@@ -1,0 +1,16 @@
+# Managed by Ansible (roles/autoscaler). Do not edit on the host.
+# Per-service scaling rules consumed by autoscaler.py. Thresholds are
+# percentages; mem_* needs the target service to declare limits.memory.
+services:
+{% for s in autoscale_services %}
+  - name: {{ s.name }}
+    min: {{ s.min }}
+    max: {{ s.max }}
+    cpu_high: {{ s.cpu_high }}
+    cpu_low: {{ s.cpu_low }}
+    mem_high: {{ s.mem_high }}
+    mem_low: {{ s.mem_low }}
+    step_up: {{ s.step_up }}
+    step_down: {{ s.step_down }}
+    cooldown: {{ s.cooldown }}
+{% endfor %}

@@ -24,6 +24,12 @@ docker_user: "{{ ansible_user }}"
 # that cAdvisor understands. Leave true unless you have a reason not to.
 docker_disable_containerd_snapshotter: true
 
+# Registries Docker may pull from over plain HTTP or with an untrusted TLS
+# cert (e.g. a local lab registry). Docker refuses these unless listed here.
+# Each entry is "host:port". Leave empty to not configure any.
+docker_insecure_registries:
+  - 192.168.71.100:5000
+
 # ---------------------------------------------------------------------------
 # Swarm settings
 # ---------------------------------------------------------------------------
@@ -78,3 +84,42 @@ node_exporter_image: prom/node-exporter:v1.8.2
 cadvisor_image: gcr.io/cadvisor/cadvisor:v0.49.1
 portainer_image: portainer/portainer-ce:2.21.4
 portainer_agent_image: portainer/agent:2.21.4
+
+# ---------------------------------------------------------------------------
+# Autoscaler
+# A manager-pinned service that polls Prometheus for per-service CPU/memory
+# and adjusts replica counts via the Docker API. Deployed as its own stack by
+# the 'autoscaler' role; it reuses the monitoring stack's Prometheus/cAdvisor.
+# ---------------------------------------------------------------------------
+
+# Master switch for the autoscaler play.
+autoscaler_enabled: true
+
+# Directory on the manager for the script, Dockerfile, rules, and compose file.
+autoscaler_dir: /opt/autoscaler
+
+# Local image repo name; the role appends a tag derived from the script hash.
+autoscaler_image_repo: swarm-autoscaler
+
+# How often (seconds) the autoscaler evaluates every service.
+autoscaler_poll_interval: 30
+
+# How the autoscaler reaches Prometheus. 'monitoring_prometheus' is the full
+# Swarm service name, resolvable from any container on the monitoring network.
+prometheus_query_url: "http://monitoring_prometheus:9090"
+
+# Per-service scaling rules. Thresholds are percentages of the service's own
+# CPU / memory limit, so they need deploy.resources.limits set on the target.
+# Only todo_frontend is autoscaled; todo_backend and the stateful single-replica
+# todo_db are deliberately NOT listed.
+autoscale_services:
+  - name: todo_frontend
+    min: 2
+    max: 6
+    cpu_high: 80       # CPU% of limit -> scale up
+    cpu_low: 25        # CPU% of limit -> eligible to scale down
+    mem_high: 80       # MEM% of limit -> scale up
+    mem_low: 30        # MEM% of limit -> eligible to scale down
+    step_up: 2         # scale up in larger steps than down
+    step_down: 1
+    cooldown: 120      # seconds to wait after a scaling action
