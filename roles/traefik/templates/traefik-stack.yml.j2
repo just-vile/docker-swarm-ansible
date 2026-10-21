@@ -1,0 +1,91 @@
+# Managed by Ansible (roles/traefik). Deployed with:
+#   docker stack deploy -c traefik-stack.yml traefik
+#
+# The service name becomes traefik_traefik in the swarm; the Prometheus scrape
+# config (roles/monitoring/templates/prometheus.yml.j2) relabels on that name.
+version: "3.8"
+
+networks:
+  # Shared edge network, created by the role as a standalone overlay so the app
+  # stacks can attach to it under this exact name.
+  {{ traefik_public_network }}:
+    external: true
+    name: {{ traefik_public_network }}
+{% if monitoring_enabled | bool %}
+  # Joined only so Prometheus can scrape the metrics entrypoint over the
+  # overlay instead of the metrics port having to be published on the host.
+  monitoring:
+    external: true
+    name: monitoring_monitoring
+{% endif %}
+
+services:
+  traefik:
+    image: {{ traefik_image }}
+    command:
+      # --- entrypoints ---------------------------------------------------
+      - '--entryPoints.web.address=:80'
+      - '--entryPoints.metrics.address=:{{ traefik_metrics_port }}'
+      # The dashboard's own entrypoint. Declared explicitly rather than relying
+      # on the implicit :8080 that --api.insecure would otherwise create, so the
+      # published port below is matched to something stated in the config.
+      - '--entryPoints.traefik.address=:8080'
+
+      # --- Swarm provider: discovers the frontend services ---------------
+      # Reads the labels under deploy.labels of each swarm service. Only the
+      # per-version load-balancer services and their direct-access routers
+      # come from here; the weighted split lives in the file provider below.
+      - '--providers.swarm.endpoint=unix:///var/run/docker.sock'
+      - '--providers.swarm.exposedByDefault=false'
+      - '--providers.swarm.network={{ traefik_public_network }}'
+      - '--providers.swarm.refreshSeconds=5s'
+
+      # --- file provider: the canary router and its weights --------------
+      # watch=true means shifting traffic is a file rewrite: no restart, no
+      # dropped connections.
+      - '--providers.file.directory=/etc/traefik/dynamic'
+      - '--providers.file.watch=true'
+
+      # --- metrics: per-service request counts, codes and latency --------
+      # addServicesLabels is what makes the stable/canary split visible as
+      # two separate series in Prometheus.
+      - '--metrics.prometheus=true'
+      - '--metrics.prometheus.entryPoint=metrics'
+      - '--metrics.prometheus.addServicesLabels=true'
+      - '--metrics.prometheus.addEntryPointsLabels=true'
+
+      # --- dashboard + logs ----------------------------------------------
+      # insecure=true serves the dashboard on the built-in :8080 with no auth.
+      # Lab only — same stance as the plaintext Grafana password.
+      - '--api.dashboard=true'
+      - '--api.insecure=true'
+      - '--accesslog=true'
+      - '--log.level=INFO'
+    volumes:
+      # Read-only: Traefik only ever reads the service list.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - {{ traefik_dir }}/dynamic:/etc/traefik/dynamic:ro
+    networks:
+      - {{ traefik_public_network }}
+{% if monitoring_enabled | bool %}
+      - monitoring
+{% endif %}
+    ports:
+      - "{{ traefik_http_port }}:80"
+      - "{{ traefik_dashboard_port }}:8080"
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          # The Swarm provider needs the *manager* API, not just any socket.
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        window: 120s
+      resources:
+        limits:
+          memory: {{ traefik_memory_limit }}
+        reservations:
+          memory: {{ traefik_memory_reservation }}

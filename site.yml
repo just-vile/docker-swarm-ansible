@@ -4,6 +4,9 @@
 #   Play 1: install Docker on every node
 #   Play 2: initialize the swarm on the manager
 #   Play 3: join the workers using the manager's token
+#   Play 4: monitoring stack (Prometheus + Grafana + Portainer)
+#   Play 5: Traefik edge + canary router
+#   Play 6: metric-driven autoscaler
 # Run with: ansible-playbook site.yml
 # ===========================================================================
 
@@ -32,6 +35,15 @@
   roles:
     - role: monitoring
       when: monitoring_enabled | bool
+
+- name: Deploy Traefik as the cluster edge
+  hosts: managers
+  become: true
+  roles:
+    # After monitoring: Traefik joins that stack's overlay network so its
+    # metrics entrypoint can be scraped without publishing a port.
+    - role: traefik
+      when: traefik_enabled | bool
 
 - name: Deploy the autoscaler on the manager
   hosts: managers

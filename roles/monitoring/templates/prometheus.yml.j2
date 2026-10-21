@@ -65,3 +65,33 @@ scrape_configs:
         target_label: __address__
       - source_labels: [__meta_dockerswarm_node_hostname]
         target_label: instance
+{% if traefik_enabled | bool %}
+
+  # Traefik's own metrics: per-router/service request counts, status codes and
+  # latency histograms. This is what makes the canary split measurable — with
+  # addServicesLabels on, stable and canary appear as two 'service' series.
+  # Single manager-pinned task; it joins the monitoring overlay so the metrics
+  # entrypoint never has to be published on the host.
+  - job_name: traefik
+    dockerswarm_sd_configs:
+      - host: unix:///var/run/docker.sock
+        role: tasks
+    relabel_configs:
+      - source_labels: [__meta_dockerswarm_service_name]
+        regex: traefik_traefik
+        action: keep
+      - source_labels: [__meta_dockerswarm_task_desired_state]
+        regex: running
+        action: keep
+      # Keep the task's address on the monitoring overlay, not on traefik-public.
+      - source_labels: [__meta_dockerswarm_network_name]
+        regex: .*_monitoring
+        action: keep
+      # Force the metrics entrypoint port.
+      - source_labels: [__address__]
+        regex: '([^:]+)(?::\d+)?'
+        replacement: '${1}:{{ traefik_metrics_port }}'
+        target_label: __address__
+      - source_labels: [__meta_dockerswarm_node_hostname]
+        target_label: instance
+{% endif %}

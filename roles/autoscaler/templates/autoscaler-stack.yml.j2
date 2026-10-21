@@ -18,6 +18,9 @@ services:
     environment:
       PROMETHEUS_URL: "{{ prometheus_query_url }}"
       POLL_INTERVAL: "{{ autoscaler_poll_interval }}"
+      # Averaging window for the CPU rate() query. Without this the script
+      # falls back to its own default and the group_vars knob does nothing.
+      RATE_WINDOW: "{{ autoscaler_rate_window }}"
       RULES_FILE: "/config/rules.yml"
     volumes:
       # Read-write: scaling a service is a write against the manager API.

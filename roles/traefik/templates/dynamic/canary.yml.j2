@@ -1,0 +1,47 @@
+# Managed by Ansible (roles/traefik) for the INITIAL state only.
+#
+# canary-weight.sh rewrites this file in place during a rollout, so what is on
+# the manager right now may not match this template. Re-running the playbook
+# resets the split to {{ canary_initial_stable_weight }}/{{ canary_initial_canary_weight }}.
+#
+# Traefik watches this directory (--providers.file.watch=true), so every write
+# is picked up within a second without restarting anything.
+#
+# The services referenced here (<name>@swarm) are declared by the deploy.labels
+# of the frontend services in Todo-list/docker-stack.yml and
+# Todo-list/docker-stack-canary.yml.
+
+http:
+  routers:
+    # The single public router. Low priority so the per-version direct-access
+    # routers (Host(`stable.todo.local`) / Host(`canary.todo.local`), declared
+    # on the services themselves) always win when their Host header is sent.
+    todo:
+      entryPoints:
+        - web
+      rule: "{{ canary_router_rule }}"
+      service: todo-split
+      priority: 1
+
+  services:
+    # Weighted round robin. Weights are relative, not percentages, but the
+    # helper script always writes a pair summing to 100 so they read as one.
+    todo-split:
+      weighted:
+{% if canary_sticky | bool %}
+        # Pins a browser to one version for the life of the cookie, so it can
+        # never be served index.html from one version and a hashed asset from
+        # the other. Off by default in this lab so the version flips visibly on
+        # reload; see CANARY.md.
+        sticky:
+          cookie:
+            name: todo_canary
+            httpOnly: true
+{% endif %}
+        services:
+          - name: {{ canary_stable_service }}@swarm
+            weight: {{ canary_initial_stable_weight }}
+{% if canary_initial_canary_weight | int > 0 %}
+          - name: {{ canary_canary_service }}@swarm
+            weight: {{ canary_initial_canary_weight }}
+{% endif %}

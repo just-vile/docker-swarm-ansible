@@ -21,6 +21,10 @@ lab. **Before pushing anywhere public or reusing this beyond the lab:**
   [`.gitignore`](.gitignore) so it is never committed again.
 - Change the Grafana password and move secrets into
   [Ansible Vault](https://docs.ansible.com/ansible/latest/vault_guide/index.html).
+- The **Traefik dashboard is served with `--api.insecure`**, i.e. no authentication, on
+  port 8081. Same stance as the plaintext Grafana password: fine on an isolated lab LAN,
+  not fine anywhere else. Put it behind a router with basic-auth middleware, or drop the
+  `traefik_dashboard_port` publish, before this is reachable from a real network.
 
 ---
 
@@ -139,6 +143,12 @@ Edit these only if your setup differs from the defaults.
   - `portainer_enabled: true` — set `false` to skip Portainer.
   - `configure_ufw: false` — set `true` to have the playbook open the required ports via ufw.
   - `grafana_admin_password: admin` — **change this.**
+  - `traefik_enabled: true` — set `false` to deploy without the Traefik edge. The app then
+    has no ingress unless you give the frontend its own published port back.
+  - `traefik_http_port: 80` / `traefik_dashboard_port: 8081` — change if something else on
+    your LAN already claims them.
+  - `canary_sticky: false` — set `true` to pin each visitor to one version during a
+    canary rollout (see [`../Todo-list/CANARY.md`](../Todo-list/CANARY.md)).
 
 ---
 
@@ -174,7 +184,12 @@ The run, in order (see [`site.yml`](site.yml)):
 3. **swarm** on the workers — join the swarm using that token.
 4. **monitoring** on the manager — template configs and deploy the `monitoring` stack
    (skipped if `monitoring_enabled: false`).
-5. Print the list of swarm node hostnames.
+5. **traefik** on the manager — create the `traefik-public` overlay, template the edge
+   stack and the weighted canary router, install the canary helper scripts, deploy the
+   `traefik` stack (skipped if `traefik_enabled: false`).
+6. **autoscaler** on the manager — build the autoscaler image and deploy the
+   `autoscaler` stack (skipped if `autoscaler_enabled: false`).
+7. Print the list of swarm node hostnames.
 
 ---
 
@@ -202,15 +217,24 @@ ssh root@192.168.71.100 'docker service rm web'
 
 ### Monitoring UIs (manager IP)
 
-| Service    | URL                                    | Notes                                              |
-|------------|----------------------------------------|----------------------------------------------------|
-| Grafana    | <http://192.168.71.100:3000>           | login `admin` / password from `group_vars/all.yml` |
-| Prometheus | <http://192.168.71.100:9090/targets>   | all 3 nodes should be `UP`                         |
-| Portainer  | <https://192.168.71.100:9443>          | set the admin password on first login              |
+| Service    | URL                                        | Notes                                              |
+|------------|--------------------------------------------|----------------------------------------------------|
+| Grafana    | <http://192.168.71.100:3000>               | login `admin` / password from `group_vars/all.yml` |
+| Prometheus | <http://192.168.71.100:9090/targets>       | all 3 nodes `UP`, plus the `traefik` job           |
+| Portainer  | <https://192.168.71.100:9443>              | set the admin password on first login              |
+| Traefik    | <http://192.168.71.100:8081/dashboard/>    | routers / services the edge knows about            |
 
 ```bash
 ssh root@192.168.71.100 'docker stack services monitoring'   # all replicas up
+ssh root@192.168.71.100 'docker stack services traefik'      # 1/1
 ```
+
+### Canary deployments
+
+Traefik is here so a new app version can take a slice of live traffic instead of being
+rolled out all at once. The runbook — build two versions, deploy the canary stack, step
+the weights with `/opt/traefik/canary-weight.sh`, promote or roll back — lives in
+[`../Todo-list/CANARY.md`](../Todo-list/CANARY.md).
 
 ---
 
@@ -226,6 +250,9 @@ ssh root@192.168.71.100 'docker stack services monitoring'   # all replicas up
 | Grafana "Swarm Containers" panels empty               | Containerd snapshotter still active. Ensure `docker_disable_containerd_snapshotter: true`, then re-run.             |
 | Swarm nodes can't reach each other                    | Open ports 2377/tcp, 7946/tcp+udp, 4789/udp. On a flat LAN with ufw off they're already open; else set `configure_ufw: true`. |
 | Workers join with the wrong address                   | Check `ansible_host` for each worker in `hosts.ini` and `swarm_advertise_addr` resolution in `group_vars/all.yml`.  |
+| App stack fails with `network traefik-public not found` | The `traefik` play was skipped. Set `traefik_enabled: true` and re-run, or create the overlay by hand: `docker network create -d overlay --attachable traefik-public`. |
+| Traefik task stuck `Preparing` / restarting            | It is manager-pinned and needs the Docker socket; check `docker service ps --no-trunc traefik_traefik`.             |
+| Prometheus `traefik` job missing or DOWN               | Traefik must share the monitoring overlay. Confirm `monitoring_enabled: true` and re-run; see the canary troubleshooting table in [`../Todo-list/CANARY.md`](../Todo-list/CANARY.md). |
 
 Useful flags while debugging:
 
@@ -242,11 +269,17 @@ ansible-playbook site.yml --limit swarm-wrk-1   # target one host
 To leave the swarm and wipe it (run per node as needed):
 
 ```bash
-ssh root@192.168.71.101 'docker swarm leave'                 # on each worker
+# Stacks first, so nothing is still attached to the shared overlay.
+ssh root@192.168.71.100 'docker stack rm todo-canary todo autoscaler monitoring traefik'
+ssh root@192.168.71.100 'docker network rm traefik-public'
+# Then dismantle the cluster: workers leave, manager last.
+ssh root@192.168.71.101 'docker swarm leave'
 ssh root@192.168.71.102 'docker swarm leave'
-ssh root@192.168.71.100 'docker swarm leave --force'         # on the manager last
-ssh root@192.168.71.100 'docker stack rm monitoring'         # remove the monitoring stack
+ssh root@192.168.71.100 'docker swarm leave --force'
 ```
+
+> `docker stack rm` returns before the tasks are gone. If `docker network rm` reports the
+> network is in use, wait a few seconds and retry.
 
 Then re-run `ansible-playbook site.yml` to rebuild from scratch.
 

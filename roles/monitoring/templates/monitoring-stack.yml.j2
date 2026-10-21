@@ -52,9 +52,16 @@ services:
       - monitoring
     deploy:
       mode: global
+      # cAdvisor's footprint grows with the number of containers it watches,
+      # and the manager watches the most. If it gets OOM-killed there, every
+      # per-container series for that node disappears — which silently blinds
+      # the autoscaler (it sees "no metrics" and holds). Keep headroom and
+      # reserve enough that the scheduler never packs the node to the edge.
       resources:
         limits:
-          memory: 256M
+          memory: {{ cadvisor_memory_limit }}
+        reservations:
+          memory: {{ cadvisor_memory_reservation }}
 
   # ---- Prometheus: scrape + TSDB (manager-pinned) ------------------------
   prometheus:
@@ -104,6 +111,12 @@ services:
       placement:
         constraints:
           - node.role == manager
+      # Bounded so a dashboard-heavy Grafana cannot crowd mongod (also
+      # manager-pinned) out of memory. Prometheus is left unbounded on
+      # purpose: a limit there gets it killed mid-compaction.
+      resources:
+        limits:
+          memory: {{ grafana_memory_limit }}
 {% if portainer_enabled | bool %}
 
   # ---- Portainer agent: one task per node --------------------------------

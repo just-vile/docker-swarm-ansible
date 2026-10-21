@@ -21,6 +21,8 @@ roles/
   docker/              # Docker CE install from the official APT repo
   swarm/               # swarm init on manager + join on workers
   monitoring/          # Prometheus + Grafana + Portainer stack (manager)
+  traefik/             # Traefik edge + weighted canary router (manager)
+  autoscaler/          # metric-driven replica autoscaler (manager)
 requirements.yml       # community.docker, community.general collections
 ```
 
@@ -100,7 +102,7 @@ ssh ubuntu@192.168.71.100 'docker service rm web'
 
 ## 5. Monitoring stack
 
-The last play deploys a monitoring stack as a single Docker stack (`monitoring`)
+A dedicated play deploys a monitoring stack as a single Docker stack (`monitoring`)
 onto the swarm. It is controlled from [`group_vars/all.yml`](group_vars/all.yml)
 (`monitoring_enabled`, ports, image tags, `portainer_enabled`).
 
@@ -135,9 +137,52 @@ Open in a browser (manager IP):
 To deploy the cluster without monitoring, set `monitoring_enabled: false`.
 Drop Portainer with `portainer_enabled: false`.
 
-## 6. Autoscaler
+## 6. Traefik edge & canary deployments
 
-The last play deploys a **metric-driven autoscaler** (role `autoscaler`, stack
+The `traefik` role deploys a manager-pinned Traefik (stack `traefik`) that becomes the
+cluster's **only HTTP ingress** on port 80, replacing the frontend's old `8080:3000`
+publish. Its reason for existing is traffic splitting: Traefik can route a chosen
+percentage of live requests to a second version of a service, which the swarm ingress
+mesh cannot do.
+
+| Setting | Where | Meaning |
+|---------|-------|---------|
+| `traefik_enabled` | `group_vars` | master switch for the play |
+| `traefik_http_port` / `traefik_dashboard_port` | `group_vars` | published ports (80 / 8081) |
+| `traefik_public_network` | `group_vars` | shared edge overlay, created by the role |
+| `canary_initial_*_weight` | `group_vars` | the split the playbook writes on every run |
+| `canary_sticky` | `group_vars` | pin a visitor to one version with a cookie (off by default) |
+
+Two providers, two jobs: the **Swarm provider** discovers each frontend service from the
+`deploy.labels` in `Todo-list/docker-stack.yml` and `docker-stack-canary.yml`, while the
+**file provider** (`/opt/traefik/dynamic/canary.yml`) owns the weighted router — a
+weighted service cannot be declared in labels at all. Traefik watches that file, so
+shifting traffic is a write, not a restart.
+
+The role also installs two helpers on the manager:
+
+```bash
+/opt/traefik/canary-weight.sh 90 10   # 10% of requests to the canary
+/opt/traefik/canary-weight.sh 100 0   # all traffic back to stable (rollback)
+/opt/traefik/split-check.sh 200       # measure the split that is actually happening
+```
+
+Traefik's own Prometheus metrics are scraped through the same `dockerswarm_sd` pattern as
+the exporters, and Grafana gets a **Canary Rollout (Traefik)** dashboard: observed share,
+per-version error ratio and per-version latency.
+
+- Traefik dashboard — <http://192.168.71.100:8081/dashboard/>
+- App (through Traefik) — <http://192.168.71.100/>
+
+The full runbook — build two versions, deploy the canary, step the weights, promote or
+roll back — is in **[`../Todo-list/CANARY.md`](../Todo-list/CANARY.md)**.
+
+To deploy the cluster without Traefik, set `traefik_enabled: false` — but then revert the
+frontend in `docker-stack.yml` to publishing its own port, or the app has no ingress.
+
+## 7. Autoscaler
+
+The final play deploys a **metric-driven autoscaler** (role `autoscaler`, stack
 `autoscaler`) onto the manager. It polls the monitoring stack's Prometheus for
 each target service's CPU and memory and changes replica counts via the Docker
 API — no extra metrics infrastructure, it reuses Prometheus + cAdvisor.
@@ -170,12 +215,18 @@ limit, and its compose `replicas` should equal the autoscaler's `min`.
 > replicas to the compose value, overriding the autoscaler until the next
 > cycle. Keeping compose `replicas` == `min` makes that reset harmless.
 
+The autoscaler and the canary router stay out of each other's way on purpose: the canary
+runs as its own stack (`todo-canary_frontend`), which matches no rule here, and the
+traffic split is set by Traefik's weights rather than by replica counts — so scaling and
+exposure remain independent decisions. Expect stable to scale *down* during a rollout as
+traffic moves off it.
+
 Watch it work:
 
 ```bash
 ssh root@192.168.71.100 'docker service logs -f autoscaler_autoscaler'
-# in another shell, drive load at the todo frontend:
-hey -z 120s -c 100 http://192.168.71.100:8080/
+# in another shell, drive load at the todo frontend (through Traefik on :80):
+hey -z 120s -c 100 http://192.168.71.100/
 ssh root@192.168.71.100 'docker service ls'   # todo_frontend climbs, then falls after load stops
 ```
 

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/traefik). Shift the canary traffic split.
+#
+#   canary-weight.sh <stable-weight> <canary-weight>
+#   canary-weight.sh            # show the current weights
+#
+# Rewrites {{ traefik_dir }}/dynamic/canary.yml. Traefik watches that directory,
+# so the new split is live within about a second — no restart, no connection
+# drops. This script talks to no API: it is a file writer, nothing else.
+set -euo pipefail
+
+DYNAMIC_FILE="{{ traefik_dir }}/dynamic/canary.yml"
+STABLE_SVC="{{ canary_stable_service }}"
+CANARY_SVC="{{ canary_canary_service }}"
+
+usage() {
+  cat >&2 <<USAGE
+usage: $(basename "$0") <stable-weight> <canary-weight>
+       $(basename "$0")                 # print the current weights
+
+  Weights are relative, but pass a pair summing to 100 so they read as
+  percentages. A canary weight of 0 removes the canary from the router
+  entirely (see the note in the script).
+
+examples:
+  $(basename "$0") 90 10     # 10% of requests to the canary
+  $(basename "$0") 100 0     # all traffic back to stable (rollback)
+USAGE
+  exit 2
+}
+
+show_current() {
+  echo "current split in $DYNAMIC_FILE:"
+  grep -E '^\s+- name:|^\s+weight:' "$DYNAMIC_FILE" | sed 's/^/  /'
+}
+
+if [[ $# -eq 0 ]]; then
+  show_current
+  exit 0
+fi
+
+[[ $# -eq 2 ]] || usage
+
+STABLE_WEIGHT=$1
+CANARY_WEIGHT=$2
+
+for w in "$STABLE_WEIGHT" "$CANARY_WEIGHT"; do
+  [[ "$w" =~ ^[0-9]+$ ]] || { echo "error: '$w' is not a non-negative integer" >&2; usage; }
+done
+
+if [[ "$STABLE_WEIGHT" -eq 0 && "$CANARY_WEIGHT" -eq 0 ]]; then
+  echo "error: both weights are 0 — that would leave the router with no backend" >&2
+  exit 1
+fi
+
+if [[ $((STABLE_WEIGHT + CANARY_WEIGHT)) -ne 100 ]]; then
+  echo "note: weights sum to $((STABLE_WEIGHT + CANARY_WEIGHT)), not 100." >&2
+  echo "      Traefik treats them as relative, so this still works, but the" >&2
+  echo "      numbers no longer read as percentages." >&2
+fi
+
+# Written to a temp file in the same directory and moved into place, so the
+# watcher never reads a half-written config.
+TMP=$(mktemp "${DYNAMIC_FILE}.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+
+{
+  printf '# Written by canary-weight.sh on %s - split %s/%s.\n' \
+    "$(date -Is)" "$STABLE_WEIGHT" "$CANARY_WEIGHT"
+  printf '# Re-running the Ansible playbook resets this file to its initial state.\n\n'
+
+  # Quoted heredoc ('YAML'), so the shell expands nothing inside it. That is
+  # not a style choice: Traefik rules contain backticks, which the shell would
+  # otherwise run as a command substitution and replace with its output.
+  cat <<'YAML'
+http:
+  routers:
+    todo:
+      entryPoints:
+        - web
+      rule: "{{ canary_router_rule }}"
+      service: todo-split
+      priority: 1
+
+  services:
+    todo-split:
+      weighted:
+{% if canary_sticky | bool %}
+        sticky:
+          cookie:
+            name: todo_canary
+            httpOnly: true
+{% endif %}
+        services:
+YAML
+
+  if [[ "$STABLE_WEIGHT" -gt 0 ]]; then
+    printf '          - name: %s@swarm\n            weight: %s\n' "$STABLE_SVC" "$STABLE_WEIGHT"
+  fi
+  # A weighted service must not reference a @swarm service that does not
+  # exist, and the canary stack is only deployed for the duration of a
+  # rollout. So at weight 0 the canary is left out of the list altogether
+  # rather than written as "weight: 0".
+  if [[ "$CANARY_WEIGHT" -gt 0 ]]; then
+    printf '          - name: %s@swarm\n            weight: %s\n' "$CANARY_SVC" "$CANARY_WEIGHT"
+  fi
+} >"$TMP"
+
+chmod 0644 "$TMP"
+mv "$TMP" "$DYNAMIC_FILE"
+trap - EXIT
+
+echo "split set to ${STABLE_WEIGHT}/${CANARY_WEIGHT} (stable/canary)"
+if [[ "$CANARY_WEIGHT" -eq 0 ]]; then
+  echo "canary removed from the router — safe to 'docker stack rm todo-canary'"
+else
+  echo "canary must be deployed: docker stack deploy -c docker-stack-canary.yml todo-canary"
+fi
+echo "verify: {{ traefik_dir }}/split-check.sh 100"

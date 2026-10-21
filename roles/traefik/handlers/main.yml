@@ -1,0 +1,8 @@
+---
+- name: Report canary weights reset
+  ansible.builtin.debug:
+    msg: >-
+      {{ traefik_dir }}/dynamic/canary.yml was rewritten from the role's
+      template: the split is now
+      {{ canary_initial_stable_weight }}/{{ canary_initial_canary_weight }}
+      (stable/canary). Use {{ traefik_dir }}/canary-weight.sh to shift it again.

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/traefik). Measure the observed traffic split.
+#
+#   split-check.sh [requests] [url]
+#
+# Fires N requests at Traefik and tallies the X-App-Version response header
+# that each frontend image stamps on every response (baked in at build time —
+# see Todo-list/frontend/Dockerfile). Prints the observed share per version,
+# which is what you compare against the weights canary-weight.sh wrote.
+#
+# Each request is independent and carries no cookie, so this measures the true
+# weighted-round-robin ratio even when sticky sessions are enabled.
+set -euo pipefail
+
+REQUESTS=${1:-100}
+URL=${2:-http://127.0.0.1:{{ traefik_http_port }}/version}
+
+[[ "$REQUESTS" =~ ^[0-9]+$ ]] || { echo "usage: $(basename "$0") [requests] [url]" >&2; exit 2; }
+
+declare -A tally=()
+failed=0
+
+echo "sending $REQUESTS requests to $URL ..."
+for _ in $(seq 1 "$REQUESTS"); do
+  version=$(curl -sS -o /dev/null -D - --max-time 5 \
+              -H 'Cache-Control: no-cache' "$URL" 2>/dev/null \
+            | tr -d '\r' \
+            | awk -F': ' 'tolower($1) == "x-app-version" { print $2 }' \
+            || true)
+  if [[ -z "$version" ]]; then
+    failed=$((failed + 1))
+  else
+    tally[$version]=$(( ${tally[$version]:-0} + 1 ))
+  fi
+done
+
+echo ""
+printf '%-12s %8s %8s\n' VERSION COUNT SHARE
+for version in "${!tally[@]}"; do
+  count=${tally[$version]}
+  printf '%-12s %8d %7.1f%%\n' "$version" "$count" \
+    "$(awk -v c="$count" -v n="$REQUESTS" 'BEGIN { printf "%.1f", (c * 100) / n }')"
+done | sort
+
+if [[ "$failed" -gt 0 ]]; then
+  echo ""
+  echo "WARNING: $failed/$REQUESTS requests returned no X-App-Version header."
+  echo "  - an old image without the header baked in, or"
+  echo "  - Traefik has no healthy backend for this route (check"
+  echo "    http://{{ swarm_advertise_addr }}:{{ traefik_dashboard_port }}/dashboard/)"
+fi

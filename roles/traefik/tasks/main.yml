@@ -1,0 +1,83 @@
+---
+# Deploy Traefik as the cluster's HTTP edge, with a weighted (canary) router.
+#
+# Runs on the manager only (see site.yml): the Swarm provider talks to the
+# manager API over the Docker socket, so Traefik has to live where that socket
+# is a manager's. Same shape as the 'monitoring' role — template config into
+# {{ traefik_dir }} on the manager, bind-mount it, deploy one stack.
+#
+# Traffic splitting is done by the *file* provider, not by labels: a weighted
+# round-robin service can only be declared there. The Swarm provider's job is
+# just to discover the two frontend services and their ports.
+
+- name: Ensure the Traefik config directories exist on the manager
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ traefik_dir }}"
+    - "{{ traefik_dir }}/dynamic"
+
+# A standalone (not stack-owned) network, so both the Traefik stack and the app
+# stacks can attach to it as 'external' under one stable name. Creating it from
+# a stack instead would name it <stack>_traefik-public and couple every other
+# compose file to that stack's name.
+- name: Create the shared edge overlay network
+  community.docker.docker_network:
+    name: "{{ traefik_public_network }}"
+    driver: overlay
+    scope: swarm
+    attachable: true
+    state: present
+
+- name: Template the Traefik dynamic (canary) configuration
+  ansible.builtin.template:
+    src: dynamic/canary.yml.j2
+    dest: "{{ traefik_dir }}/dynamic/canary.yml"
+    mode: "0644"
+    # Hand-edited between demo runs by canary-weight.sh. Re-running the
+    # playbook deliberately resets the split to the declared initial weights.
+  notify: Report canary weights reset
+
+- name: Install the canary helper scripts
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "{{ traefik_dir }}/{{ item }}"
+    mode: "0755"
+  loop:
+    - canary-weight.sh
+    - split-check.sh
+
+- name: Template the Traefik stack compose file
+  ansible.builtin.template:
+    src: traefik-stack.yml.j2
+    dest: "{{ traefik_dir }}/traefik-stack.yml"
+    mode: "0644"
+
+# Only the app port and the dashboard are published. The metrics entrypoint is
+# reached over the monitoring overlay, so it stays off the host entirely.
+- name: Open the Traefik ports (ufw)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop:
+    - "{{ traefik_http_port }}"
+    - "{{ traefik_dashboard_port }}"
+  when: configure_ufw | bool
+
+# Same dependency the monitoring role installs for the docker_stack module.
+- name: Install Python deps for the docker_stack module
+  ansible.builtin.pip:
+    name:
+      - jsondiff
+      - pyyaml
+    state: present
+
+- name: Deploy the Traefik stack
+  community.docker.docker_stack:
+    name: traefik
+    compose:
+      - "{{ traefik_dir }}/traefik-stack.yml"
+    state: present

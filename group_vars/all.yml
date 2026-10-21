@@ -77,6 +77,18 @@ alertmanager_enabled: false
 # Portainer (cluster/stack management UI + per-node agent).
 portainer_enabled: true
 
+# Memory budget for the agents on each node. cAdvisor is the autoscaler's only
+# source of per-container metrics, so if it is OOM-killed the autoscaler goes
+# blind and stops scaling — give it headroom rather than the tightest limit
+# that happens to work on an idle cluster.
+cadvisor_memory_limit: 512M
+cadvisor_memory_reservation: 128M
+
+# Grafana is bounded so it cannot crowd the manager-pinned database out of
+# memory. Prometheus is intentionally left unbounded (a limit gets it killed
+# mid-compaction); give the manager VM enough RAM instead.
+grafana_memory_limit: 384M
+
 # Pinned image tags for reproducible deploys.
 prometheus_image: prom/prometheus:v2.54.1
 grafana_image: grafana/grafana:11.2.0
@@ -102,7 +114,14 @@ autoscaler_dir: /opt/autoscaler
 autoscaler_image_repo: swarm-autoscaler
 
 # How often (seconds) the autoscaler evaluates every service.
-autoscaler_poll_interval: 30
+autoscaler_poll_interval: 15
+
+# Averaging window for the CPU rate query. This is the autoscaler's reaction
+# time: a 2m window spreads a 90s burst over two minutes, so a short load test
+# peaks at roughly (burst / window) of the real CPU figure and never crosses
+# cpu_high. Keep it a small multiple of Prometheus' 15s scrape_interval (>=4
+# samples) so the average is still stable.
+autoscaler_rate_window: 60s
 
 # How the autoscaler reaches Prometheus. 'monitoring_prometheus' is the full
 # Swarm service name, resolvable from any container on the monitoring network.
@@ -123,3 +142,66 @@ autoscale_services:
     step_up: 2         # scale up in larger steps than down
     step_down: 1
     cooldown: 120      # seconds to wait after a scaling action
+
+# ---------------------------------------------------------------------------
+# Traefik edge + canary deployments
+# A manager-pinned reverse proxy that becomes the cluster's only HTTP ingress.
+# It discovers the frontend services through the Swarm provider and splits
+# traffic between them with a weighted round-robin service declared in a file
+# the 'traefik' role templates. See Todo-list/CANARY.md for the runbook.
+# ---------------------------------------------------------------------------
+
+# Master switch for the Traefik play.
+traefik_enabled: true
+
+# Directory on the manager for the stack file, dynamic config, and helpers.
+traefik_dir: /opt/traefik
+
+# Pinned image tag for reproducible deploys. v3.1+ is required: the Swarm
+# provider ('--providers.swarm.*') is a separate provider from the Docker one
+# only from that version on.
+traefik_image: traefik:v3.7.16
+
+# Published ports on the manager. 80 replaces the frontend's old 8080 publish
+# as the app's entrypoint; 8081 avoids colliding with it during a transition.
+traefik_http_port: 80
+traefik_dashboard_port: 8081
+
+# Prometheus metrics entrypoint. Deliberately NOT published: Traefik joins the
+# monitoring overlay and is scraped there.
+traefik_metrics_port: 8082
+
+# Bounded like Grafana so the edge cannot crowd the manager-pinned database out
+# of memory. Traefik's footprint is small and flat; this is generous headroom.
+traefik_memory_limit: 256M
+traefik_memory_reservation: 64M
+
+# Standalone overlay network shared by the Traefik stack and both app stacks.
+# Created by the role, referenced as 'external' everywhere else, so no compose
+# file is coupled to a stack name.
+traefik_public_network: traefik-public
+
+# ---------------------------------------------------------------------------
+# Canary routing
+# ---------------------------------------------------------------------------
+
+# Rule for the public router. Everything on the entrypoint goes to the weighted
+# service; the per-version Host(...) routers declared in the app stacks' labels
+# have a higher priority, so they still win for direct verification.
+canary_router_rule: "PathPrefix(`/`)"
+
+# Traefik service names declared by deploy.labels in the two app stacks. The
+# file provider references them as "<name>@swarm".
+canary_stable_service: todo-stable
+canary_canary_service: todo-canary
+
+# Split the playbook writes on every run. Keep the canary at 0 so a fresh
+# deploy never routes to a canary stack that isn't there.
+canary_initial_stable_weight: 100
+canary_initial_canary_weight: 0
+
+# Pin each visitor to one version with a cookie. OFF by default so the version
+# flips visibly on reload, which is the point of the demo. Turn it ON for a
+# realistic rollout: without it a browser can load index.html from one version
+# and a hashed asset from the other. See the caveat in Todo-list/CANARY.md.
+canary_sticky: false

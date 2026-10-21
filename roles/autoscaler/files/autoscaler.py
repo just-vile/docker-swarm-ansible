@@ -14,8 +14,8 @@ The target is clamped to [min, max], up-steps are larger than down-steps,
 and a per-service cooldown prevents oscillation. Every decision is logged
 with the metric values that triggered it.
 
-Configuration comes from env (PROMETHEUS_URL, POLL_INTERVAL, RULES_FILE)
-and a YAML rules file. The Docker socket is mounted read-write.
+Configuration comes from env (PROMETHEUS_URL, POLL_INTERVAL, RATE_WINDOW,
+RULES_FILE) and a YAML rules file. The Docker socket is mounted read-write.
 """
 import os
 import sys
@@ -27,25 +27,40 @@ import yaml
 import docker
 
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://monitoring_prometheus:9090")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "15"))
 RULES_FILE = os.environ.get("RULES_FILE", "/config/rules.yml")
+# Averaging window for the CPU rate. This is the autoscaler's reaction time:
+# rate() reports the *average* over the window, so a burst shorter than the
+# window is scaled down by (burst / window) and can stay under cpu_high for
+# its entire duration. Keep it >= 4 Prometheus scrape intervals.
+RATE_WINDOW = os.environ.get("RATE_WINDOW", "60s")
 
 # PromQL templates keyed by the Swarm service name (cAdvisor label).
 # CPU is normalized to the container's CPU limit (quota/period), so the
 # threshold means "percent of the service's CPU limit" and matches how memory
 # is computed. Requires deploy.resources.limits.cpus on the target service.
+#
+# Both ratios aggregate each side to a single label-less value *before*
+# dividing. That is not cosmetic: PromQL's one-to-one vector matching only
+# pairs samples whose label sets are identical, and cAdvisor tags
+# container_cpu_usage_seconds_total with cpu="total" while the
+# container_spec_* gauges carry no cpu label. Dividing the raw selectors
+# therefore matches nothing and the query silently returns no data — which
+# this autoscaler reports as "cpu=n/a" and treats as a calm signal forever.
+# sum()/sum() is also the figure we actually want: total cores used over
+# total cores granted = mean utilisation across the service's replicas.
 CPU_EXPR = (
-    'avg(rate(container_cpu_usage_seconds_total'
-    '{{container_label_com_docker_swarm_service_name="{svc}"}}[2m])'
-    ' / (container_spec_cpu_quota'
+    'sum(rate(container_cpu_usage_seconds_total'
+    '{{container_label_com_docker_swarm_service_name="{svc}"}}[{window}]))'
+    ' / sum(container_spec_cpu_quota'
     '{{container_label_com_docker_swarm_service_name="{svc}"}}'
     ' / container_spec_cpu_period'
-    '{{container_label_com_docker_swarm_service_name="{svc}"}})) * 100'
+    '{{container_label_com_docker_swarm_service_name="{svc}"}}) * 100'
 )
 MEM_EXPR = (
-    'avg(container_memory_usage_bytes'
+    'sum(container_memory_usage_bytes'
     '{{container_label_com_docker_swarm_service_name="{svc}"}})'
-    ' / avg(container_spec_memory_limit_bytes'
+    ' / sum(container_spec_memory_limit_bytes'
     '{{container_label_com_docker_swarm_service_name="{svc}"}}) * 100'
 )
 
@@ -96,6 +111,36 @@ def current_replicas(service):
     return int(replicated.get("Replicas", 0))
 
 
+def task_health(service):
+    """Return (running task count, newest task error) for a service.
+
+    Used to refuse scaling up a service that cannot even place the replicas
+    it already has — an unpullable image, for instance, makes every new task
+    Rejected, so adding replicas just multiplies the rejections silently.
+    """
+    try:
+        tasks = service.tasks()
+    except (docker.errors.DockerException, requests.RequestException) as exc:
+        log.warning("could not list tasks for %s: %s", service.name, exc)
+        return None, None
+
+    running = 0
+    newest_ts = ""
+    last_error = None
+    for task in tasks:
+        status = task.get("Status", {})
+        state = status.get("State")
+        if state == "running":
+            running += 1
+            continue
+        err = status.get("Err")
+        # Task timestamps are RFC3339, so string order is chronological.
+        ts = task.get("UpdatedAt", "")
+        if err and state in ("rejected", "failed") and ts >= newest_ts:
+            newest_ts, last_error = ts, err
+    return running, last_error
+
+
 def decide(cpu, mem, current, rule):
     """Compute the clamped target replica count for one service."""
     scale_up = (cpu is not None and cpu >= rule["cpu_high"]) or (
@@ -122,10 +167,17 @@ def main():
     client = docker.from_env()
     rules = load_rules(RULES_FILE)
     log.info(
-        "Autoscaler started: %d service(s), poll=%ds, prometheus=%s",
-        len(rules), POLL_INTERVAL, PROMETHEUS_URL,
+        "Autoscaler started: %d service(s), poll=%ds, window=%s, prometheus=%s",
+        len(rules), POLL_INTERVAL, RATE_WINDOW, PROMETHEUS_URL,
     )
     last_scaled = {}
+    # Consecutive failed lookups per service, so a service that stays absent
+    # (or a redeploy that briefly removes it) does not fill the log with one
+    # identical warning per poll.
+    lookup_misses = {}
+    # Services already warned about a missing CPU series, so the hint that
+    # explains cpu=n/a is logged once rather than every cycle.
+    cpu_blind = set()
 
     while True:
         for rule in rules:
@@ -139,19 +191,50 @@ def main():
             try:
                 service = client.services.get(name)
             except docker.errors.NotFound:
-                log.warning("service %s not found, skipping", name)
+                misses = lookup_misses.get(name, 0) + 1
+                lookup_misses[name] = misses
+                # First miss, then every 10th: a stack redeploy makes the
+                # service vanish for a cycle or two and that is not news.
+                if misses == 1 or misses % 10 == 0:
+                    log.warning(
+                        "service %s not found, skipping (%d consecutive)",
+                        name, misses,
+                    )
                 continue
+            except (docker.errors.DockerException, requests.RequestException) as exc:
+                # A blip on the manager socket must not kill the loop: without
+                # this the exception escapes, the container exits, and the
+                # service only scales again once Swarm has restarted it.
+                log.warning("docker API error looking up %s: %s", name, exc)
+                continue
+
+            if lookup_misses.pop(name, 0):
+                log.info("service %s found again", name)
 
             current = current_replicas(service)
             if current is None:
                 log.warning("service %s is not replicated, skipping", name)
                 continue
 
-            cpu = prom_query(CPU_EXPR.format(svc=name))
+            cpu = prom_query(CPU_EXPR.format(svc=name, window=RATE_WINDOW))
             mem = prom_query(MEM_EXPR.format(svc=name))
             if cpu is None and mem is None:
                 log.info("%s: no metrics yet, holding at %d", name, current)
                 continue
+
+            if cpu is None and name not in cpu_blind:
+                # Memory is reporting, so cAdvisor is being scraped: the CPU
+                # ratio is missing its denominator. Almost always a service
+                # with no deploy.resources.limits.cpus, which makes cAdvisor
+                # omit container_spec_cpu_quota entirely.
+                cpu_blind.add(name)
+                log.warning(
+                    "%s: no CPU signal (memory is reporting) - check that the "
+                    "service declares deploy.resources.limits.cpus so cAdvisor "
+                    "exports container_spec_cpu_quota", name,
+                )
+            elif cpu is not None:
+                cpu_blind.discard(name)
 
             target = decide(cpu, mem, current, rule)
             if target == current:
@@ -161,6 +244,16 @@ def main():
                 )
                 continue
 
+            if target > current:
+                running, task_error = task_health(service)
+                if running is not None and running < current:
+                    log.warning(
+                        "%s: not scaling up to %d, only %d/%d task(s) running%s",
+                        name, target, running, current,
+                        f" - last task error: {task_error}" if task_error else "",
+                    )
+                    continue
+
             direction = "UP" if target > current else "DOWN"
             log.info(
                 "%s: scale %s %d -> %d (cpu=%s mem=%s)",
@@ -169,7 +262,7 @@ def main():
             try:
                 service.scale(target)
                 last_scaled[name] = now + rule["cooldown"]
-            except docker.errors.APIError as exc:
+            except (docker.errors.DockerException, requests.RequestException) as exc:
                 log.error("failed to scale %s: %s", name, exc)
 
         time.sleep(POLL_INTERVAL)
