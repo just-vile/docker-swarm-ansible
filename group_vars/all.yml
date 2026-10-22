@@ -114,14 +114,19 @@ autoscaler_dir: /opt/autoscaler
 autoscaler_image_repo: swarm-autoscaler
 
 # How often (seconds) the autoscaler evaluates every service.
-autoscaler_poll_interval: 15
+autoscaler_poll_interval: 10
 
 # Averaging window for the CPU rate query. This is the autoscaler's reaction
 # time: a 2m window spreads a 90s burst over two minutes, so a short load test
 # peaks at roughly (burst / window) of the real CPU figure and never crosses
-# cpu_high. Keep it a small multiple of Prometheus' 15s scrape_interval (>=4
-# samples) so the average is still stable.
-autoscaler_rate_window: 60s
+# cpu_high.
+#
+# 30s is two of Prometheus' 15s scrapes — the fewest rate() will accept, and
+# deliberately at that floor so a demo reacts in ~40s instead of ~90s. The
+# trade is noise: with two samples a single late or missed scrape visibly
+# moves the figure, so expect the logged cpu% to jitter between polls. Use
+# 60s (four samples) for anything where stability matters more than latency.
+autoscaler_rate_window: 30s
 
 # How the autoscaler reaches Prometheus. 'monitoring_prometheus' is the full
 # Swarm service name, resolvable from any container on the monitoring network.
