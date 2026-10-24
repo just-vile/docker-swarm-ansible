@@ -121,12 +121,16 @@ autoscaler_poll_interval: 10
 # peaks at roughly (burst / window) of the real CPU figure and never crosses
 # cpu_high.
 #
-# 30s is two of Prometheus' 15s scrapes — the fewest rate() will accept, and
-# deliberately at that floor so a demo reacts in ~40s instead of ~90s. The
-# trade is noise: with two samples a single late or missed scrape visibly
-# moves the figure, so expect the logged cpu% to jitter between polls. Use
-# 60s (four samples) for anything where stability matters more than latency.
-autoscaler_rate_window: 30s
+# 60s is four of Prometheus' 15s scrapes. Do not drop this to 30s to make a
+# demo react faster: 30s holds exactly two samples in the best case, and
+# rate() returns *nothing* with fewer than two, so one late scrape (or one
+# dropped as a duplicate timestamp — cAdvisor stamps its own housekeeping
+# time, and housekeeping_interval equals the scrape interval) empties the
+# query. The autoscaler then logs cpu=n/a and, because decide() reads a
+# missing CPU signal as calm, stops scaling on CPU altogether. Memory hides
+# the problem: it is an instant selector, so Prometheus' 5m lookback keeps
+# serving it across the same gaps.
+autoscaler_rate_window: 60s
 
 # How the autoscaler reaches Prometheus. 'monitoring_prometheus' is the full
 # Swarm service name, resolvable from any container on the monitoring network.

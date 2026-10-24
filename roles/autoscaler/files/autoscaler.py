@@ -63,6 +63,19 @@ MEM_EXPR = (
     ' / sum(container_spec_memory_limit_bytes'
     '{{container_label_com_docker_swarm_service_name="{svc}"}}) * 100'
 )
+# Diagnostics, run only when CPU_EXPR comes back empty: the two halves of the
+# ratio fail for unrelated reasons and need opposite fixes, so the warning
+# asks Prometheus which one is missing instead of guessing.
+CPU_LIMIT_EXPR = (
+    'sum(container_spec_cpu_quota'
+    '{{container_label_com_docker_swarm_service_name="{svc}"}}'
+    ' / container_spec_cpu_period'
+    '{{container_label_com_docker_swarm_service_name="{svc}"}})'
+)
+CPU_SAMPLES_EXPR = (
+    'max(count_over_time(container_cpu_usage_seconds_total'
+    '{{container_label_com_docker_swarm_service_name="{svc}"}}[{window}]))'
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +176,28 @@ def fmt(value):
     return "n/a" if value is None else f"{value:.1f}%"
 
 
+def cpu_blind_hint(name):
+    """Say which half of the CPU ratio is missing, for the cpu=n/a warning.
+
+    No quota means the service declares no deploy.resources.limits.cpus, so
+    cAdvisor omits container_spec_cpu_quota and the denominator is empty.
+    A quota plus fewer than two samples in the window means the numerator is
+    empty instead: rate() needs two points and returns nothing with one, so
+    RATE_WINDOW is too short for the Prometheus scrape interval. Memory does
+    not show this because an instant selector gets a 5m lookback.
+    """
+    # 0 counts as absent: a container with no quota reports 0, not a limit.
+    if not prom_query(CPU_LIMIT_EXPR.format(svc=name)):
+        return ("no container_spec_cpu_quota - the service declares no "
+                "deploy.resources.limits.cpus")
+    samples = prom_query(CPU_SAMPLES_EXPR.format(svc=name, window=RATE_WINDOW))
+    if samples is not None and samples < 2:
+        return (f"only {samples:.0f} scrape(s) in the {RATE_WINDOW} rate "
+                "window, rate() needs 2 - raise RATE_WINDOW to >= 4 scrape "
+                "intervals")
+    return "the CPU query returned no data"
+
+
 def main():
     client = docker.from_env()
     rules = load_rules(RULES_FILE)
@@ -175,9 +210,10 @@ def main():
     # (or a redeploy that briefly removes it) does not fill the log with one
     # identical warning per poll.
     lookup_misses = {}
-    # Services already warned about a missing CPU series, so the hint that
-    # explains cpu=n/a is logged once rather than every cycle.
-    cpu_blind = set()
+    # Consecutive polls with no CPU reading per service. A set would not do:
+    # the signal flaps (one sample lands in the rate window, the next does
+    # not), and clearing on a single success re-warns every other cycle.
+    cpu_misses = {}
 
     while True:
         for rule in rules:
@@ -222,19 +258,21 @@ def main():
                 log.info("%s: no metrics yet, holding at %d", name, current)
                 continue
 
-            if cpu is None and name not in cpu_blind:
-                # Memory is reporting, so cAdvisor is being scraped: the CPU
-                # ratio is missing its denominator. Almost always a service
-                # with no deploy.resources.limits.cpus, which makes cAdvisor
-                # omit container_spec_cpu_quota entirely.
-                cpu_blind.add(name)
-                log.warning(
-                    "%s: no CPU signal (memory is reporting) - check that the "
-                    "service declares deploy.resources.limits.cpus so cAdvisor "
-                    "exports container_spec_cpu_quota", name,
-                )
-            elif cpu is not None:
-                cpu_blind.discard(name)
+            if cpu is None:
+                # Memory is reporting, so cAdvisor is being scraped and the
+                # containers exist: something in CPU_EXPR alone is empty.
+                misses = cpu_misses.get(name, 0) + 1
+                cpu_misses[name] = misses
+                # First miss, then every 10th, as for a missing service: the
+                # extra queries behind the hint are not worth one per poll.
+                if misses == 1 or misses % 10 == 0:
+                    log.warning(
+                        "%s: no CPU signal (memory is reporting) - %s "
+                        "(%d consecutive)",
+                        name, cpu_blind_hint(name), misses,
+                    )
+            elif cpu_misses.pop(name, 0):
+                log.info("%s: CPU signal back", name)
 
             target = decide(cpu, mem, current, rule)
             if target == current:
